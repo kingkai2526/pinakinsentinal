@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#
+# block-local-ping.sh
+# Interactive script to block ICMP echo-request (ping) from a local subnet and optional specific IP.
+# Designed for Kali/Debian-style systems (iptables). Use with sudo or as root.
+#
+# What it does:
+#  - Asks for subnet (CIDR) and optional single IP
+#  - Validates inputs (basic)
+#  - Backs up current iptables rules
+#  - Adds DROP rules for ICMP echo-request from the subnet and IP
+#  - Attempts to save rules persistently to /etc/iptables/rules.v4 (if available)
+#  - Prints how to revert the changes
+#
+
+set -euo pipefail
+
+# Helpers
+err() { echo "ERROR: $*" >&2; }
+info() { echo -e "\e[1;34mINFO:\e[0m $*"; }
+warn() { echo -e "\e[1;33mWARN:\e[0m $*"; }
+
+# Basic CIDR validation (very permissive). Accepts e.g. 192.168.1.0/24 or 10.0.0.0/16
+is_valid_cidr() {
+  local cidr="$1"
+  if [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+    # Validate each octet <=255
+    IFS='/' read -r ip mask <<< "$cidr"
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for oct in $o1 $o2 $o3 $o4; do
+      if (( oct < 0 || oct > 255 )); then
+        return 1
+      fi
+    done
+    return 0
+  fi
+  return 1
+}
+
+# Basic IPv4 validation for single IP
+is_valid_ip() {
+  local ip="$1"
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for oct in $o1 $o2 $o3 $o4; do
+      if (( oct < 0 || oct > 255 )); then
+        return 1
+      fi
+    done
+    return 0
+  fi
+  return 1
+}
+
+# Ensure running as root
+if [[ $EUID -ne 0 ]]; then
+  err "This script must be run as root or with sudo."
+  exit 2
+fi
+
+# Ensure iptables exists
+if ! command -v iptables >/dev/null 2>&1; then
+  err "iptables command not found. Install iptables or run on a system that has it."
+  exit 3
+fi
+
+echo "This script will block ICMP echo-request (ping) FROM a local subnet (and optional single IP)."
+echo "It will not change other iptables policies. A backup of your current rules will be created."
+echo
+
+# Read subnet
+read -rp "Enter the local subnet to block (CIDR, e.g. 192.168.1.0/24): " SUBNET
+if ! is_valid_cidr "$SUBNET"; then
+  err "Invalid CIDR format: $SUBNET"
+  exit 4
+fi
+
+# Read optional single IP to block as well
+read -rp "Optionally enter a single IP to block too (leave empty to skip): " SINGLE_IP
+if [[ -n "$SINGLE_IP" ]]; then
+  if ! is_valid_ip "$SINGLE_IP"; then
+    err "Invalid IP address: $SINGLE_IP"
+    exit 5
+  fi
+fi
+
+# Backup current iptables
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="/etc/iptables/backups"
+mkdir -p "$BACKUP_DIR"
+BACKUP_FILE="${BACKUP_DIR}/iptables-backup-${TIMESTAMP}.rules"
+info "Backing up current iptables rules to $BACKUP_FILE"
+iptables-save > "$BACKUP_FILE"
+
+# Also keep a temp local backup
+TMP_BACKUP="/tmp/iptables-backup-${TIMESTAMP}.rules"
+iptables-save > "$TMP_BACKUP"
+
+# Function to add rule if not present (using iptables -C to check)
+add_rule_if_missing() {
+  local src="$1"
+  # Insert at top of INPUT chain to make it effective immediately
+  # Rule: drop icmp echo-request from source
+  if iptables -C INPUT -s "$src" -p icmp --icmp-type echo-request -j DROP >/dev/null 2>&1; then
+    info "Rule already present for $src — skipping."
+  else
+    info "Adding DROP rule for ICMP echo-request from $src"
+    iptables -I INPUT -s "$src" -p icmp --icmp-type echo-request -j DROP
+  fi
+}
+
+# Add rule for subnet
+add_rule_if_missing "$SUBNET"
+
+# Add rule for single IP if provided
+if [[ -n "$SINGLE_IP" ]]; then
+  add_rule_if_missing "$SINGLE_IP"
+fi
+
+# Show the added rules
+echo
+info "Current INPUT chain rules (showing ICMP-related lines):"
+iptables -L INPUT -n --line-numbers | grep -i icmp || true
+echo
+
+# Try to persist rules (Debian/Kali typical path)
+PERSIST_PATH="/etc/iptables/rules.v4"
+if command -v iptables-save >/dev/null 2>&1; then
+  if [[ -d /etc/iptables || -w /etc/iptables ]]; then
+    info "Attempting to save current iptables rules to $PERSIST_PATH"
+    mkdir -p /etc/iptables
+    iptables-save > "$PERSIST_PATH"
+    if [[ $? -eq 0 ]]; then
+      info "Saved rules to $PERSIST_PATH (will persist on reboot if iptables-persistent/netfilter-persistent is installed)."
+    else
+      warn "Failed to save to $PERSIST_PATH. You may need to install iptables-persistent or netfilter-persistent."
+    fi
+  else
+    warn "No /etc/iptables directory or insufficient permissions to write persistent rules."
+  fi
+else
+  warn "iptables-save not available; cannot save persistent rules automatically."
+fi
+
+# If iptables-persistent is installed, attempt to invoke its save service
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  info "Running netfilter-persistent save (if available)..."
+  netfilter-persistent save || warn "netfilter-persistent save returned non-zero; check manually."
+elif command -v invoke-rc.d >/dev/null 2>&1 && [[ -f /etc/init.d/iptables-persistent ]]; then
+  info "Saving using iptables-persistent service..."
+  invoke-rc.d iptables-persistent save || warn "iptables-persistent save returned non-zero; check manually."
+else
+  warn "iptables-persistent or netfilter-persistent not found. To make rules persistent across reboots, install 'iptables-persistent' (Debian/Kali) or create a systemd unit that restores /etc/iptables/rules.v4 at boot."
+fi
+
+echo
+echo -e "\e[1;32mDONE\e[0m — pings from $SUBNET $( [[ -n "$SINGLE_IP" ]] && echo "and $SINGLE_IP " )are now blocked."
+echo
+echo "How to test from a remote machine on the LAN:"
+echo "  ping <target-machine-ip>        # should NOT get replies if run from inside the blocked subnet/IP"
+echo
+echo "How to revert (temporary revert immediately):"
+echo "  sudo iptables -D INPUT -s $SUBNET -p icmp --icmp-type echo-request -j DROP"
+if [[ -n "$SINGLE_IP" ]]; then
+  echo "  sudo iptables -D INPUT -s $SINGLE_IP -p icmp --icmp-type echo-request -j DROP"
+fi
+echo
+echo "To restore your backed-up rules completely:"
+echo "  sudo iptables-restore < $BACKUP_FILE"
+echo
+echo "Notes / Safety:"
+echo " - Blocking ping can interfere with network scanning/monitoring and legitimate troubleshooting."
+echo " - The script only blocks ICMP echo-requests for the specified sources (does NOT change other firewall rules)."
+echo " - Persistence method may vary by distro. On Debian/Kali, install 'iptables-persistent' to automatically load /etc/iptables/rules.v4 at boot:"
+echo "     sudo apt-get install iptables-persistent"
+echo
+info "Backup saved: $BACKUP_FILE and $TMP_BACKUP"
+info "If you want the script to also set sysctl net.ipv4.icmp_echo_ignore_all=1 (global ignore all pings), run manually with caution. That will stop all ping replies from the machine."
+echo
+info "Script finished."
